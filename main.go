@@ -5,17 +5,15 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
-	"strconv"
+	"strings"
 	"time"
 
 	"github.com/diamondburned/catnip-gtk/cmd/catnip-gtk/catnipgtk"
+	"github.com/diamondburned/wyzenip/internal/bulb"
 	"github.com/diamondburned/wyzenip/internal/catnipdraw"
 	"github.com/noriah/catnip/input"
-	"github.com/pkg/errors"
 
 	// Input backends.
 	_ "github.com/noriah/catnip/input/ffmpeg"
@@ -24,11 +22,18 @@ import (
 
 const bars = 2
 
+func mustEnv(key string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		log.Fatalf("missing env var $%s", key)
+	}
+	return v
+}
+
 func main() {
-	username := os.Getenv("admin_username")
-	password := os.Getenv("admin_password")
-	if username == "" || password == "" {
-		log.Fatalln("missing $admin_{username,password}")
+	mqttURL := mustEnv("mqtt_url")
+	if !strings.Contains(mqttURL, "://") {
+		log.Fatalln("invalid mqtt URL missing scheme")
 	}
 
 	cfg, err := catnipgtk.ReadUserConfig()
@@ -42,10 +47,16 @@ func main() {
 	cfg.Visualizer.Distribution = catnipgtk.DistributeEqual
 	cfg.Visualizer.SmoothFactor = 0
 
+	drawer := catnipdraw.NewDrawer(cfg, 10)
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	drawer := catnipdraw.NewDrawer(cfg, 10)
+	client, err := bulb.Connect(ctx, mqttURL)
+	if err != nil {
+		log.Fatalln("failed to init MQTT:", err)
+	}
+	defer client.Disconnect()
 
 	drawDone := make(chan error)
 	go func() {
@@ -53,35 +64,47 @@ func main() {
 		cancel()
 	}()
 
-	bulb := Bulb{
-		username: username,
-		password: password,
-		endpoint: "http://192.168.1.7",
-	}
+	updateTick := time.NewTicker(time.Second / 30)
+	defer updateTick.Stop()
+
+	dimmer := bulb.NewDimmer(client)
+	dimmer.SetBlocking(true)
 
 	lastTime := time.Now()
+
+	var intensity int
+	var changed bool
 
 mainLoop:
 	for {
 		select {
 		case err = <-drawDone:
 			break mainLoop
-		default:
+		case <-updateTick.C:
+			// ok
 		}
 
-		var intensity int
+		const (
+			min = 85
+			max = 100
+			mod = 2
+		)
 
 		drawer.View(func(bars [][]input.Sample) {
-			perc := math.Min(bars[0][2], 15) / 15 * 100
-			intensity = int(math.Round(perc))
+			perc := math.Min(bars[0][2], 15) / 15 * (max - min)
+			nint := roundMod(int(min+math.Round(perc)), mod)
+			changed = nint != intensity
+			intensity = nint
 		})
 
-		if err := bulb.ChangeIntensity(ctx, intensity); err != nil {
-			log.Fatalln("failed to change intensity:", err)
+		if changed {
+			if err := dimmer.Dim(ctx, intensity); err != nil {
+				log.Fatalln("failed to change intensity:", err)
+			}
 		}
 
 		now := time.Now()
-		fmt.Printf("\rLatency: %dms", now.Sub(lastTime).Milliseconds())
+		fmt.Printf("\rLatency: %03dms, Intensity %d%%", now.Sub(lastTime).Milliseconds(), intensity)
 		lastTime = now
 	}
 
@@ -90,38 +113,6 @@ mainLoop:
 	}
 }
 
-type Bulb struct {
-	username string
-	password string
-	endpoint string
-}
-
-func (b Bulb) ChangeIntensity(ctx context.Context, intensity int) error {
-	if intensity < 0 || intensity > 100 {
-		return fmt.Errorf("intensity %d out of range", intensity)
-	}
-
-	bulbValues := url.Values{
-		"m":  {"1"},
-		"d0": {strconv.Itoa(intensity)},
-	}
-
-	r, err := http.NewRequestWithContext(ctx, "GET", b.endpoint+"/?"+bulbValues.Encode(), nil)
-	if err != nil {
-		return errors.Wrap(err, "failed to create request")
-	}
-
-	r.SetBasicAuth(b.username, b.password)
-
-	response, err := http.DefaultClient.Do(r)
-	if err != nil {
-		return errors.Wrap(err, "failed to do request")
-	}
-	defer response.Body.Close()
-
-	if response.StatusCode != 200 {
-		return fmt.Errorf("unexpected status code %d", response.StatusCode)
-	}
-
-	return nil
+func roundMod(i, mod int) int {
+	return i - (i % mod)
 }
